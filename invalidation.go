@@ -28,10 +28,10 @@ type staleEntry struct {
 // RequestMeta is the per-request invalidation snapshot consumers see on hook
 // contexts. Mirrors TS `_RequestMeta` and Python `_RequestMeta`.
 type RequestMeta struct {
-	Selector       string
-	IsStale        bool
-	InvalidatedBy  []string
-	SeqSnapshot    uint64
+	Selector      string
+	IsStale       bool
+	InvalidatedBy []string
+	SeqSnapshot   uint64
 }
 
 func compilePattern(pattern string) *regexp.Regexp {

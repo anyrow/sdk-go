@@ -48,20 +48,20 @@ type ResponseContext struct {
 
 // Config holds all configuration for the SDK client.
 type Config struct {
-	BaseURL string
-	BearerToken string
-	Headers map[string]string
-	Timeout time.Duration
-	ThrowOnError bool
-	StaleMaxEntries int
-	Invalidation *InvalidationConfig
-	OnAuthExpired func(context.Context) (string, error)
-	HTTPClient *http.Client
-	AuthHeaderName string
+	BaseURL          string
+	BearerToken      string
+	Headers          map[string]string
+	Timeout          time.Duration
+	ThrowOnError     bool
+	StaleMaxEntries  int
+	Invalidation     *InvalidationConfig
+	OnAuthExpired    func(context.Context) (string, error)
+	HTTPClient       *http.Client
+	AuthHeaderName   string
 	AuthHeaderPrefix string
-	OnRequest []func(*RequestContext) error
-	OnResponse []func(*ResponseContext) error
-	OnLog func(LogEntry)
+	OnRequest        []func(*RequestContext) error
+	OnResponse       []func(*ResponseContext) error
+	OnLog            func(LogEntry)
 }
 
 // LogEntry is the payload passed to Config.OnLog. Consumers plug in their own

@@ -7,9 +7,9 @@ import "net/http"
 // In safe mode, methods return SDKResult[T] instead of (*T, error).
 // The error is embedded in the result — the outer error return is always nil in safe mode.
 type SDKResult[T any] struct {
-	Data *T
-	Err APIError
-	Status int
+	Data     *T
+	Err      APIError
+	Status   int
 	Response *http.Response
 }
 
