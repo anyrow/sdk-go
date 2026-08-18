@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"iter"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -49,9 +50,9 @@ var invalidationMap = map[string]map[string]serviceEntry{
 	},
 	"extract": {
 		"once":         {Method: "POST", Path: "/v1/projects/{project_id}/extract", Params: []string{"project_id"}, SSE: false, WS: false, Invalidate: nil},
-		"stream":       {Method: "POST", Path: "/v1/projects/{project_id}/extract-stream", Params: []string{"project_id"}, SSE: false, WS: false, Invalidate: nil},
+		"stream":       {Method: "POST", Path: "/v1/projects/{project_id}/extract-stream", Params: []string{"project_id"}, SSE: true, WS: false, Invalidate: nil},
 		"table.once":   {Method: "POST", Path: "/v1/projects/{project_id}/tables/{table_id}/extract", Params: []string{"project_id", "table_id"}, SSE: false, WS: false, Invalidate: nil},
-		"table.stream": {Method: "POST", Path: "/v1/projects/{project_id}/tables/{table_id}/extract-stream", Params: []string{"project_id", "table_id"}, SSE: false, WS: false, Invalidate: nil},
+		"table.stream": {Method: "POST", Path: "/v1/projects/{project_id}/tables/{table_id}/extract-stream", Params: []string{"project_id", "table_id"}, SSE: true, WS: false, Invalidate: nil},
 	},
 	"row": {
 		"aggregate": {Method: "GET", Path: "/v1/projects/{project_id}/tables/{table_id}/rows/aggregate", Params: []string{"project_id", "table_id"}, SSE: false, WS: false, Invalidate: nil},
@@ -201,9 +202,6 @@ func (b *BatchResource) List(ctx context.Context, project_id string, opts *Batch
 	}
 	if opts != nil && opts.Q != nil {
 		q.Set("q", *opts.Q)
-	}
-	if opts != nil && opts.Select != nil {
-		q.Set("select", *opts.Select)
 	}
 	if opts != nil && opts.Status != nil {
 		q.Set("status", string(*opts.Status))
@@ -470,23 +468,42 @@ func (e *ExtractResource) Once(ctx context.Context, project_id string, opts *Ext
 }
 
 // Stream — Extract data from text or file (SSE stream)
-func (e *ExtractResource) Stream(ctx context.Context, project_id string, opts *ExtractStreamOpts) (*json.RawMessage, error) {
-	q := url.Values{}
-	var callHeaders map[string]string
-	if opts != nil {
-		callHeaders = opts.Headers
-	}
-	result, err := doRequest(ctx, e.client.cfg, "POST", "/v1/projects/"+url.PathEscape(project_id)+"/extract-stream", q, nil, nil, "", callHeaders, "POST /v1/projects/{project_id}/extract-stream", nil)
-	if err != nil {
-		return nil, err
-	}
-	var out json.RawMessage
-	if len(result.body) > 0 {
-		if err := json.Unmarshal(result.body, &out); err != nil {
-			return nil, err
+func (e *ExtractResource) Stream(ctx context.Context, project_id string, opts *ExtractStreamOpts) iter.Seq2[SSEEvent, error] {
+	return func(yield func(SSEEvent, error) bool) {
+		callHeaders := map[string]string{"Accept": "text/event-stream"}
+		if opts != nil && opts.LastEventID != "" {
+			callHeaders["Last-Event-ID"] = opts.LastEventID
+		}
+		if opts != nil {
+			for k, v := range opts.Headers {
+				callHeaders[k] = v
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, "GET", e.client.cfg.BaseURL+"/v1/projects/"+url.PathEscape(project_id)+"/extract-stream", nil)
+		if err != nil {
+			yield(SSEEvent{}, err)
+			return
+		}
+		for k, v := range e.client.cfg.Headers {
+			req.Header.Set(k, v)
+		}
+		for k, v := range callHeaders {
+			req.Header.Set(k, v)
+		}
+		if e.client.cfg.BearerToken != "" {
+			req.Header.Set(e.client.cfg.AuthHeaderName, e.client.cfg.AuthHeaderPrefix+e.client.cfg.BearerToken)
+		}
+		resp, err := e.client.cfg.HTTPClient.Do(req)
+		if err != nil {
+			yield(SSEEvent{}, err)
+			return
+		}
+		for ev, err := range parseSSEStream(ctx, resp) {
+			if !yield(ev, err) {
+				return
+			}
 		}
 	}
-	return &out, nil
 }
 
 type ExtractTableResource struct {
@@ -519,23 +536,42 @@ func (t *ExtractTableResource) Once(ctx context.Context, project_id string, tabl
 }
 
 // Stream — Extract into table (SSE stream)
-func (t *ExtractTableResource) Stream(ctx context.Context, project_id string, table_id string, opts *ExtractTableStreamOpts) (*json.RawMessage, error) {
-	q := url.Values{}
-	var callHeaders map[string]string
-	if opts != nil {
-		callHeaders = opts.Headers
-	}
-	result, err := doRequest(ctx, t.client.cfg, "POST", "/v1/projects/"+url.PathEscape(project_id)+"/tables/"+url.PathEscape(table_id)+"/extract-stream", q, nil, nil, "", callHeaders, "POST /v1/projects/{project_id}/tables/{table_id}/extract-stream", nil)
-	if err != nil {
-		return nil, err
-	}
-	var out json.RawMessage
-	if len(result.body) > 0 {
-		if err := json.Unmarshal(result.body, &out); err != nil {
-			return nil, err
+func (t *ExtractTableResource) Stream(ctx context.Context, project_id string, table_id string, opts *ExtractTableStreamOpts) iter.Seq2[SSEEvent, error] {
+	return func(yield func(SSEEvent, error) bool) {
+		callHeaders := map[string]string{"Accept": "text/event-stream"}
+		if opts != nil && opts.LastEventID != "" {
+			callHeaders["Last-Event-ID"] = opts.LastEventID
+		}
+		if opts != nil {
+			for k, v := range opts.Headers {
+				callHeaders[k] = v
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, "GET", t.client.cfg.BaseURL+"/v1/projects/"+url.PathEscape(project_id)+"/tables/"+url.PathEscape(table_id)+"/extract-stream", nil)
+		if err != nil {
+			yield(SSEEvent{}, err)
+			return
+		}
+		for k, v := range t.client.cfg.Headers {
+			req.Header.Set(k, v)
+		}
+		for k, v := range callHeaders {
+			req.Header.Set(k, v)
+		}
+		if t.client.cfg.BearerToken != "" {
+			req.Header.Set(t.client.cfg.AuthHeaderName, t.client.cfg.AuthHeaderPrefix+t.client.cfg.BearerToken)
+		}
+		resp, err := t.client.cfg.HTTPClient.Do(req)
+		if err != nil {
+			yield(SSEEvent{}, err)
+			return
+		}
+		for ev, err := range parseSSEStream(ctx, resp) {
+			if !yield(ev, err) {
+				return
+			}
 		}
 	}
-	return &out, nil
 }
 
 type RowResource struct {
@@ -594,7 +630,7 @@ func (r *RowResource) Bulk(ctx context.Context, project_id string, table_id stri
 }
 
 // Create — Create row
-func (r *RowResource) Create(ctx context.Context, project_id string, table_id string, body CreateProjectsTablesRowRequest, opts *RowCreateOpts) (*CreateProjectsTablesRowRequest, error) {
+func (r *RowResource) Create(ctx context.Context, project_id string, table_id string, body CreateProjectsTablesRowRequest, opts *RowCreateOpts) (*CreateProjectsTablesRowResponse201, error) {
 	q := url.Values{}
 	var callHeaders map[string]string
 	if opts != nil {
@@ -604,7 +640,7 @@ func (r *RowResource) Create(ctx context.Context, project_id string, table_id st
 	if err != nil {
 		return nil, err
 	}
-	var out CreateProjectsTablesRowRequest
+	var out CreateProjectsTablesRowResponse201
 	if len(result.body) > 0 {
 		if err := json.Unmarshal(result.body, &out); err != nil {
 			return nil, err
@@ -634,7 +670,7 @@ func (r *RowResource) Delete(ctx context.Context, project_id string, table_id st
 }
 
 // Get — Get row
-func (r *RowResource) Get(ctx context.Context, project_id string, table_id string, row_id string, opts *RowGetOpts) (*CreateProjectsTablesRowRequest, error) {
+func (r *RowResource) Get(ctx context.Context, project_id string, table_id string, row_id string, opts *RowGetOpts) (*CreateProjectsTablesRowResponse201, error) {
 	q := url.Values{}
 	var callHeaders map[string]string
 	if opts != nil {
@@ -644,7 +680,7 @@ func (r *RowResource) Get(ctx context.Context, project_id string, table_id strin
 	if err != nil {
 		return nil, err
 	}
-	var out CreateProjectsTablesRowRequest
+	var out CreateProjectsTablesRowResponse201
 	if len(result.body) > 0 {
 		if err := json.Unmarshal(result.body, &out); err != nil {
 			return nil, err
@@ -692,7 +728,7 @@ func (r *RowResource) List(ctx context.Context, project_id string, table_id stri
 }
 
 // Update — Update row
-func (r *RowResource) Update(ctx context.Context, project_id string, table_id string, row_id string, body CreateProjectsTablesRowRequest, opts *RowUpdateOpts) (*CreateProjectsTablesRowRequest, error) {
+func (r *RowResource) Update(ctx context.Context, project_id string, table_id string, row_id string, body CreateProjectsTablesRowRequest, opts *RowUpdateOpts) (*CreateProjectsTablesRowResponse201, error) {
 	q := url.Values{}
 	var callHeaders map[string]string
 	if opts != nil {
@@ -702,7 +738,7 @@ func (r *RowResource) Update(ctx context.Context, project_id string, table_id st
 	if err != nil {
 		return nil, err
 	}
-	var out CreateProjectsTablesRowRequest
+	var out CreateProjectsTablesRowResponse201
 	if len(result.body) > 0 {
 		if err := json.Unmarshal(result.body, &out); err != nil {
 			return nil, err
@@ -810,7 +846,7 @@ func (t *TableResource) Duplicate(ctx context.Context, project_id string, table_
 }
 
 // Export — Export table rows
-func (t *TableResource) Export(ctx context.Context, project_id string, table_id string, opts *TableExportOpts) (*GetProjectsExportResponse200, error) {
+func (t *TableResource) Export(ctx context.Context, project_id string, table_id string, opts *TableExportOpts) (*ListProjectsTablesExportResponse200, error) {
 	q := url.Values{}
 	if opts != nil && opts.Filter != nil {
 		q.Set("filter", *opts.Filter)
@@ -838,7 +874,7 @@ func (t *TableResource) Export(ctx context.Context, project_id string, table_id 
 	if err != nil {
 		return nil, err
 	}
-	var out GetProjectsExportResponse200
+	var out ListProjectsTablesExportResponse200
 	if len(result.body) > 0 {
 		if err := json.Unmarshal(result.body, &out); err != nil {
 			return nil, err
@@ -890,9 +926,6 @@ func (t *TableResource) List(ctx context.Context, project_id string, opts *Table
 	}
 	if opts != nil && opts.Q != nil {
 		q.Set("q", *opts.Q)
-	}
-	if opts != nil && opts.Select != nil {
-		q.Set("select", *opts.Select)
 	}
 	var callHeaders map[string]string
 	if opts != nil {
@@ -1088,9 +1121,6 @@ func (t *TableTemplateResource) ProjectList(ctx context.Context, project_id stri
 	if opts != nil && opts.Q != nil {
 		q.Set("q", *opts.Q)
 	}
-	if opts != nil && opts.Select != nil {
-		q.Set("select", *opts.Select)
-	}
 	var callHeaders map[string]string
 	if opts != nil {
 		callHeaders = opts.Headers
@@ -1224,9 +1254,6 @@ func (w *WebhookResource) Deliveries(ctx context.Context, organization_id string
 	if opts != nil && opts.Q != nil {
 		q.Set("q", *opts.Q)
 	}
-	if opts != nil && opts.Select != nil {
-		q.Set("select", *opts.Select)
-	}
 	if opts != nil && opts.Status != nil {
 		q.Set("status", string(*opts.Status))
 	}
@@ -1290,9 +1317,6 @@ func (w *WebhookResource) List(ctx context.Context, organization_id string, opts
 	}
 	if opts != nil && opts.Q != nil {
 		q.Set("q", *opts.Q)
-	}
-	if opts != nil && opts.Select != nil {
-		q.Set("select", *opts.Select)
 	}
 	var callHeaders map[string]string
 	if opts != nil {
@@ -1406,7 +1430,6 @@ type BatchListOpts struct {
 	Order   *string
 	Page    *int64
 	Q       *string
-	Select  *string
 	Status  *BatchListOptsStatus
 	Headers map[string]string
 }
@@ -1442,7 +1465,8 @@ type ExtractOnceOpts struct {
 }
 
 type ExtractStreamOpts struct {
-	Headers map[string]string
+	LastEventID string
+	Headers     map[string]string
 }
 
 type ExtractTableOnceOpts struct {
@@ -1450,7 +1474,8 @@ type ExtractTableOnceOpts struct {
 }
 
 type ExtractTableStreamOpts struct {
-	Headers map[string]string
+	LastEventID string
+	Headers     map[string]string
 }
 
 type RowAggregateOpts struct {
@@ -1542,7 +1567,6 @@ type TableListOpts struct {
 	Order   *string
 	Page    *int64
 	Q       *string
-	Select  *string
 	Headers map[string]string
 }
 
@@ -1586,7 +1610,6 @@ type TableTemplateProjectListOpts struct {
 	Order   *string
 	Page    *int64
 	Q       *string
-	Select  *string
 	Headers map[string]string
 }
 
@@ -1632,7 +1655,6 @@ type WebhookDeliveriesOpts struct {
 	Order   *string
 	Page    *int64
 	Q       *string
-	Select  *string
 	Status  *WebhookDeliveriesOptsStatus
 	Headers map[string]string
 }
@@ -1649,7 +1671,6 @@ type WebhookListOpts struct {
 	Order   *string
 	Page    *int64
 	Q       *string
-	Select  *string
 	Headers map[string]string
 }
 
