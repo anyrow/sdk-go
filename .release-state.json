@@ -93,5 +93,5 @@
 		"UpdateProjectsTablesColumnRequest": "32c530afd1484b071b447a786eab7e30e9d1cff24b82cdcdec18e547acd2c03e",
 		"UpdateTableTemplateRequest": "6e28128f077f8377e6970de394b72a7a545c0f90260d5d14d86f738c4fbead0b"
 	},
-	"version": "1.0.0"
+	"version": "1.0.3"
 }
