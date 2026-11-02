@@ -5,6 +5,7 @@ package sdk
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"iter"
 	"net/http"
@@ -12,138 +13,174 @@ import (
 	"strings"
 )
 
-// SSEEvent represents a single server-sent event.
-type SSEEvent struct {
-	Data  string
+// SSEEvent is one server-sent event. Data is the event's data decoded into T, or as sent for
+// SSEEvent[string]. ID is the last event ID seen on the stream so far (the spec's sticky "last
+// event ID buffer"), to resume from with Last-Event-ID. A stream method's iterator closes the
+// response body when its range ends, a break included, so leaving the loop frees the connection.
+type SSEEvent[T any] struct {
+	Data  T
 	Event string
 	ID    string
 	Retry int
 }
 
-const sseMaxBuffer = 1024 * 1024
+// sseMaxLine caps one line, and sseMaxEvent the data of one event.
+const (
+	sseMaxLine  = 1 << 20
+	sseMaxEvent = 8 << 20
+)
 
-// parseSSEStream returns an iter.Seq2 that yields SSEEvent values read from resp.Body.
-// On non-2xx response it yields a typed error immediately then terminates.
-// The response body is closed when the iterator returns.
-//
-// Ported from public/honey/core/src/client/sse.ts:62-102 — bufio.Scanner with
-// double-newline split mirrors the TextDecoder+split(/\r\n\r\n|…/) approach.
-func parseSSEStream(ctx context.Context, resp *http.Response) iter.Seq2[SSEEvent, error] {
-	return func(yield func(SSEEvent, error) bool) {
+// ErrSSELineTooLong is returned when a single SSE line exceeds 1 MiB.
+var ErrSSELineTooLong = errors.New("honey: sse line exceeds 1 MiB")
+
+// ErrSSEEventTooLarge is returned when one event's data exceeds 8 MiB.
+var ErrSSEEventTooLarge = errors.New("honey: sse event exceeds 8 MiB")
+
+// parseSSEStream yields the events of resp and closes its body when done. A non-2xx response
+// yields its typed error and ends; a canceled ctx ends the stream quietly.
+func parseSSEStream(ctx context.Context, resp *http.Response) iter.Seq2[SSEEvent[string], error] {
+	return func(yield func(SSEEvent[string], error) bool) {
 		defer resp.Body.Close()
-
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			body, _ := io.ReadAll(resp.Body)
-			apiErr := raiseForStatus(resp, body)
-			yield(SSEEvent{}, apiErr)
+			body, _ := readBody(resp.Body, 64<<10)
+			yield(SSEEvent[string]{}, raiseForStatus(resp, body))
 			return
 		}
-
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 4096), sseMaxBuffer)
-		scanner.Split(splitDoubleNewline)
-
-		for scanner.Scan() {
+		for ev, err := range parseSSE(wireBody{ctx, resp.Body}) {
 			if ctx.Err() != nil {
 				return
 			}
-			block := scanner.Text()
-			if strings.TrimSpace(block) == "" {
-				continue
-			}
-			ev, ok := parseSSEBlock(block)
-			if !ok {
-				continue
-			}
-			if !yield(ev, nil) {
+			if !yield(ev, err) || err != nil {
 				return
 			}
 		}
-
-		if err := scanner.Err(); err != nil {
-			yield(SSEEvent{}, err)
-		}
 	}
 }
 
-// splitDoubleNewline is a bufio.SplitFunc that splits on \r\n\r\n, \n\n, or \r\r.
-func splitDoubleNewline(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	delimiters := []string{"\r\n\r\n", "\n\n", "\r\r"}
-	for _, d := range delimiters {
-		db := []byte(d)
-		for i := 0; i <= len(data)-len(db); i++ {
-			match := true
-			for j := range db {
-				if data[i+j] != db[j] {
-					match = false
-					break
+// wireBody is a body whose failed read is a call's no-answer error.
+type wireBody struct {
+	ctx context.Context
+	io.Reader
+}
+
+func (b wireBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	if err != nil && err != io.EOF {
+		err = wrapTransportError(b.ctx, err)
+	}
+	return n, err
+}
+
+// sseState is the parser's event under construction and its sticky fields.
+type sseState struct {
+	data    strings.Builder
+	hasData bool
+	event   string
+	lastID  string
+	retry   int
+}
+
+// parseSSE implements the WHATWG event-stream parser: lines end in CRLF, LF or CR; a blank line
+// dispatches; a final event without its blank line is discarded; the id is sticky across events
+// and an id holding NUL is ignored; retry takes ASCII digits only; a leading BOM is skipped.
+func parseSSE(r io.Reader) iter.Seq2[SSEEvent[string], error] {
+	return func(yield func(SSEEvent[string], error) bool) {
+		lines := &sseLines{br: bufio.NewReaderSize(r, 64<<10)}
+		var st sseState
+		for first := true; ; first = false {
+			line, err := lines.next()
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					yield(SSEEvent[string]{}, err)
 				}
+				return
 			}
-			if match {
-				return i + len(db), data[:i], nil
+			if first {
+				line = strings.TrimPrefix(line, "\uFEFF")
 			}
+			if line != "" {
+				if err := st.field(line); err != nil {
+					yield(SSEEvent[string]{}, err)
+					return
+				}
+				continue
+			}
+			if st.hasData && !yield(SSEEvent[string]{Data: st.data.String(), Event: st.event, ID: st.lastID, Retry: st.retry}, nil) {
+				return
+			}
+			st.data.Reset()
+			st.hasData, st.event, st.retry = false, "", 0
 		}
 	}
-	if atEOF && len(data) > 0 {
-		return len(data), data, nil
-	}
-	return 0, nil, nil
 }
 
-func parseSSEBlock(block string) (SSEEvent, bool) {
-	lines := strings.Split(block, "\n")
-	isComment := true
-	var data string
-	hasData := false
-	var event string
-	var id string
-	retry := 0
-
-	for _, rawLine := range lines {
-		line := strings.TrimRight(rawLine, "\r")
-		if strings.HasPrefix(line, ":") {
-			continue
+// field applies one non-blank line to the event under construction.
+func (st *sseState) field(line string) error {
+	if strings.HasPrefix(line, ":") {
+		return nil
+	}
+	name, value := line, ""
+	if i := strings.IndexByte(line, ':'); i >= 0 {
+		name, value = line[:i], strings.TrimPrefix(line[i+1:], " ")
+	}
+	switch name {
+	case "data":
+		if st.hasData {
+			st.data.WriteByte('\n')
 		}
-		isComment = false
-
-		colonIdx := strings.IndexByte(line, ':')
-		var field, val string
-		if colonIdx == -1 {
-			field = line
-			val = ""
-		} else {
-			field = line[:colonIdx]
-			val = line[colonIdx+1:]
-			if strings.HasPrefix(val, " ") {
-				val = val[1:]
-			}
+		if st.data.Len()+len(value) > sseMaxEvent {
+			return ErrSSEEventTooLarge
 		}
-
-		switch field {
-		case "data":
-			if !hasData {
-				data = val
-			} else {
-				data = data + "\n" + val
-			}
-			hasData = true
-		case "event":
-			event = val
-		case "id":
-			/* per spec: id containing null byte must be ignored */
-			if !strings.ContainsRune(val, 0) {
-				id = val
-			}
-		case "retry":
-			if n, err := strconv.Atoi(val); err == nil && n >= 0 {
-				retry = n
+		st.data.WriteString(value)
+		st.hasData = true
+	case "event":
+		st.event = value
+	case "id":
+		if !strings.ContainsRune(value, 0) {
+			st.lastID = value
+		}
+	case "retry":
+		if value != "" && strings.Trim(value, "0123456789") == "" {
+			if n, err := strconv.Atoi(value); err == nil {
+				st.retry = n
 			}
 		}
 	}
+	return nil
+}
 
-	if isComment || !hasData {
-		return SSEEvent{}, false
+// sseLines reads lines ending in CRLF, LF or CR. After a CR it skips one LF on the next read
+// instead of peeking, so a CR-terminated line dispatches without waiting for more bytes.
+type sseLines struct {
+	br     *bufio.Reader
+	skipLF bool
+}
+
+// next reads one line without its terminator. io.EOF is returned only when no complete line
+// remains, so a truncated final line is never parsed.
+func (l *sseLines) next() (string, error) {
+	var b strings.Builder
+	for {
+		c, err := l.br.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if l.skipLF {
+			l.skipLF = false
+			if c == '\n' {
+				continue
+			}
+		}
+		switch c {
+		case '\n':
+			return b.String(), nil
+		case '\r':
+			l.skipLF = true
+			return b.String(), nil
+		}
+		if b.Len() >= sseMaxLine {
+			return "", ErrSSELineTooLong
+		}
+		b.WriteByte(c)
 	}
-
-	return SSEEvent{Data: data, Event: event, ID: id, Retry: retry}, true
 }
